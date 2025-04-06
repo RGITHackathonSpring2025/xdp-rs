@@ -11,6 +11,7 @@ rules:
     allow_http_only:
       - 80
       - 443
+      - 8443
   udp:
     allow:
     block:
