@@ -15,10 +15,19 @@ use network_types::{
     eth::{EthHdr, EtherType},
     ip::{Ipv4Hdr, IpProto, Ipv6Hdr},
     tcp::TcpHdr,
+    udp::UdpHdr,
 };
 
-#[map(name = "PERMITTED_PORTS")]
-static mut PERMITTED_PORTS: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+// Rule types: 0 = BLOCK, 1 = ALLOW, 2 = ALLOW_HTTP_ONLY
+#[map(name = "TCP_RULES")]
+static mut TCP_RULES: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+
+#[map(name = "UDP_RULES")]
+static mut UDP_RULES: HashMap<u16, u8> = HashMap::with_max_entries(1024, 0);
+
+// Default policy: 0 = DROP, 1 = ACCEPT
+#[map(name = "DEFAULT_POLICY")]
+static mut DEFAULT_POLICY: HashMap<u32, u8> = HashMap::with_max_entries(1, 0);
 
 const HTTP_METHODS: [&[u8]; 9] = [
     b"GET ",
@@ -96,7 +105,6 @@ fn is_http_traffic(ctx: &XdpContext, offset: usize) -> bool {
                 }
             }
             if is_match {
-                info!(ctx, "Detected HTTP method in packet");
                 return true;
             }
         }
@@ -113,7 +121,6 @@ fn is_http_traffic(ctx: &XdpContext, offset: usize) -> bool {
                 }
             }
             if is_match {
-                info!(ctx, "Detected HTTP version in packet");
                 return true;
             }
         }
@@ -130,7 +137,6 @@ fn is_http_traffic(ctx: &XdpContext, offset: usize) -> bool {
                 }
             }
             if is_match {
-                info!(ctx, "Detected HTTP header in packet");
                 return true;
             }
         }
@@ -147,13 +153,20 @@ fn is_http_traffic(ctx: &XdpContext, offset: usize) -> bool {
                 }
             }
             if is_match {
-                info!(ctx, "Detected TLS handshake in packet");
                 return true;
             }
         }
     }
     
     false
+}
+
+fn get_default_action() -> u32 {
+    // Get default policy, or DROP if not set
+    match unsafe { DEFAULT_POLICY.get(&0) } {
+        Some(&1) => xdp_action::XDP_PASS,
+        _ => xdp_action::XDP_DROP,
+    }
 }
 
 fn try_xdp_firewall(ctx: XdpContext) -> Result<u32, ()> {
@@ -174,8 +187,8 @@ fn try_xdp_firewall(ctx: XdpContext) -> Result<u32, ()> {
             offset += Ipv6Hdr::LEN;
         }
         _ => {
-            info!(&ctx, "Non-IP packet dropped");
-            return Ok(xdp_action::XDP_DROP);
+            // Non-IP packets use default policy
+            return Ok(get_default_action());
         }
     }
 
@@ -184,33 +197,71 @@ fn try_xdp_firewall(ctx: XdpContext) -> Result<u32, ()> {
             let tcphdr: *const TcpHdr = ptr_at(&ctx, offset)?;
             let dst_port = u16::from_be(unsafe { (*tcphdr).dest });
             
-            // First check if port is permitted
-            if unsafe { PERMITTED_PORTS.get(&dst_port).is_none() } {
-                info!(&ctx, "BLOCKED DST PORT dropped: {}", dst_port);
-                return Ok(xdp_action::XDP_DROP);
+            // Check if we have a rule for this port
+            match unsafe { TCP_RULES.get(&dst_port) } {
+                // BLOCK
+                Some(&0) => {
+                    info!(&ctx, "TCP port {} blocked by rule", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                },
+                // ALLOW
+                Some(&1) => {
+                    info!(&ctx, "TCP port {} allowed by rule", dst_port);
+                    return Ok(xdp_action::XDP_PASS);
+                },
+                // ALLOW_HTTP_ONLY
+                Some(&2) => {
+                    // Calculate TCP header length to find payload
+                    let tcp_header_len = (unsafe { (*tcphdr).doff() } as usize) * 4;
+                    offset += tcp_header_len;
+                    
+                    // Check if this is HTTP/HTTPS traffic by inspecting packet contents
+                    if is_http_traffic(&ctx, offset) {
+                        info!(&ctx, "HTTP/HTTPS traffic allowed on port {}", dst_port);
+                        return Ok(xdp_action::XDP_PASS);
+                    }
+                    
+                    // Block non-HTTP traffic
+                    info!(&ctx, "Non-HTTP/HTTPS traffic blocked on port {}", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                },
+                // No rule found, use default policy
+                None => {
+                    return Ok(get_default_action());
+                },
+                Some(&(2_u8..=u8::MAX)) => {
+                    return Ok(get_default_action());
+                }
             }
-            
-            // Calculate TCP header length to find payload
-            let tcp_header_len = (unsafe { (*tcphdr).doff() } as usize) * 4;
-            offset += tcp_header_len;
-            
-            // Check if this is HTTP/HTTPS traffic by inspecting packet contents
-            if is_http_traffic(&ctx, offset) {
-                info!(&ctx, "Allowing HTTP/HTTPS traffic");
-                return Ok(xdp_action::XDP_PASS);
-            }
-            
-            // Block non-HTTP traffic
-            info!(&ctx, "Blocking non-HTTP/HTTPS TCP traffic");
-            return Ok(xdp_action::XDP_DROP);
         }
         IpProto::Udp => {
-            info!(&ctx, "UDP dropped");
-            return Ok(xdp_action::XDP_DROP);
+            let udphdr: *const UdpHdr = ptr_at(&ctx, offset)?;
+            let dst_port = u16::from_be(unsafe { (*udphdr).dest });
+            
+            // Check if we have a rule for this UDP port
+            match unsafe { UDP_RULES.get(&dst_port) } {
+                // BLOCK
+                Some(&0) => {
+                    info!(&ctx, "UDP port {} blocked by rule", dst_port);
+                    return Ok(xdp_action::XDP_DROP);
+                },
+                // ALLOW
+                Some(&1) => {
+                    info!(&ctx, "UDP port {} allowed by rule", dst_port);
+                    return Ok(xdp_action::XDP_PASS);
+                },
+                // No rule found, use default policy
+                None => {
+                    return Ok(get_default_action());
+                },
+                Some(&(2_u8..=u8::MAX)) => {
+                    return Ok(get_default_action());
+                }
+            }
         }
         _ => {
-            info!(&ctx, "Unknown protocol dropped");
-            return Ok(xdp_action::XDP_DROP);
+            // Other protocols use default policy
+            return Ok(get_default_action());
         }
     }
 }

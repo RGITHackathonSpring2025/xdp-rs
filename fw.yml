@@ -1,0 +1,16 @@
+default_policy: DROP
+
+rules:
+  tcp:
+    block:
+      - 5242
+    
+    allow:
+      - 8080
+    
+    allow_http_only:
+      - 80
+      - 443
+  udp:
+    allow:
+    block:
